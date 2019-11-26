@@ -81,3 +81,9 @@ yarn-debug.log*
 yarn-error.log*
 
 .stencil/
+
+
+# fastlane
+fastlane/report.xml
+fastlane/.env.secret
+.android_signing

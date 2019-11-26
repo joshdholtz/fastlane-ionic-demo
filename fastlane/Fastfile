@@ -1,0 +1,231 @@
+fastlane_require "dotenv"
+
+Dotenv.load ".env.secret"
+
+ENVIRONMENTS = ['dev', 'prod']
+lane :configure do |options|
+  env = options[:env] || Fastlane::Actions.lane_context[Fastlane::Actions::SharedValues::ENVIRONMENT]
+  if env.nil? || !ENVIRONMENTS.include?(env)
+    env = UI.select("Which env?", ENVIRONMENTS)
+  end
+  Dotenv.load(".env.#{env}")
+end
+
+lane :init_platforms do
+  sh "ionic integrations enable capacitor"
+  sh "ionic build"
+  sh "ionic cap add ios"
+  sh "ionic cap add android"
+end
+
+lane :bump do |options|
+  last_version = get_info_plist_value(
+    path: info_plist_path,
+    key: "CFBundleShortVersionString"
+  )
+
+  # Prompt version number
+  version = nil
+  loop do
+    defaulting = last_version.empty? ? "" : " (#{last_version})"
+    version = options[:version] || UI.input("Version#{defaulting}?")
+    version = last_version if version.empty?    
+
+    break if version && !version.empty?
+  end
+
+  # Prompt build number
+  build_number = options[:build_number] || UI.input("Build number (defaults to current timestamp)?")
+  build_number = Time.now.to_i if build_number.nil? || build_number.empty? 
+
+  set_info_plist_value(
+    path: info_plist_path,
+    key: "CFBundleVersion",
+    value: build_number.to_s
+  )
+
+  set_info_plist_value(
+    path: info_plist_path,
+    key: "CFBundleShortVersionString",
+    value: version
+  )
+
+  android_set_version_name(
+    gradle_file: gradle_file,
+    version_name: version
+  )
+
+  android_set_version_code(
+    gradle_file: gradle_file,
+    version_code: build_number
+  )
+end
+
+desc "Shortcut for getting the project Info.plist"
+lane :info_plist_path do
+  File.absolute_path("../ios/App/App/Info.plist")
+end
+
+desc "Shortcut for getting the gradle file"
+lane :gradle_file do
+  File.absolute_path("../android/app/build.gradle")
+end
+
+lane :ionic_build do |options|
+  unless options[:local_dev]
+    prod_flag = "--prod"
+  end
+
+  sh "(cd .. && CI=false ionic build #{prod_flag} #{ENV['IONIC_BUILD_CONFIGURATION']})".chomp
+  sh "(cd .. && npx cap copy)"
+  sh "(cd .. && npx cap sync)"
+end
+
+platform :ios do
+  before_all do
+    setup_circle_ci
+  end
+
+  desc "Prompts for all information to register a device to an Apple Developer account"
+  lane :add_device do
+    register_device
+  end
+  
+  desc "Adds and prepares the iOS platform (also applies any project fixes)"
+  lane :prepare do
+    configure
+    produce unless is_ci
+    ionic_build
+    cocoapods(
+      podfile: "./ios/App"
+    )
+  end
+
+  lane :rematch do
+    configure
+    match(force: true)
+  end
+  
+  desc "Builds the iOS binary"
+  lane :build do
+    # Get certificates and profiles for building
+    match(readonly: is_ci)
+
+    # Build the IPA binary
+    gym(
+      workspace: workspace_path,
+      export_team_id: ENV['FASTLANE_TEAM_ID']
+    )
+  end
+    
+  desc "Builds and distributes the iOS staging binary from a clean state"
+  lane :staging do
+    prepare
+    build
+
+    path = [ENV['S3_BUCKET_APP_DIRECTORY'], 'ios']
+    path += ['pr', ci_pr_number] if ci_pr_number
+   
+    aws_s3(
+      app_directory: File.join(path)
+    ) unless ENV['SKIP_DISTRIBUTION']
+
+    url = Actions.lane_context[SharedValues::S3_HTML_OUTPUT_PATH]
+    comment_on_pr(
+      body: "Download iOS app at #{url}" 
+    )
+  end
+
+  desc "Builds and distributes the iOS release binary from a clean state"
+  lane :release do
+    prepare
+
+    # Update the Xcode project to use a specific provisioning profile
+    update_provisioning_profile_specifier(
+      xcodeproj: project_path,
+      new_specifier: ENV['IOS_APP_IDENTIFIER'],
+      configuration: 'Release'
+    )
+
+    # Build the IPA binary
+    gym(
+      workspace: workspace_path,
+      export_team_id: ENV['FASTLANE_TEAM_ID']
+    )
+
+    deliver(
+      skip_screenshots: true,
+      skip_metadata: true,
+      force: true
+    )
+  end
+        
+  desc "Shortcut for getting the workspace path"
+  private_lane :workspace_path do
+    File.absolute_path("../ios/App/App.xcworkspace")
+  end
+  
+  desc "Shortcut for getting the project path"
+  private_lane :project_path do
+    File.absolute_path("../ios/App/App.xcodeproj")
+  end
+end
+
+platform :android do
+  desc "Initialies the Android keystore in a hidden directory (see .env.secret)"
+  lane :keystore do
+    android_keystore
+  end
+
+  lane :copy_base64_keystore do
+    sh "(cd .. && openssl base64 -A -in .android_signing/#{ENV['ANDROID_KEYSTORE_KEYSTORE_NAME']} | pbcopy)"
+  end
+  
+  desc "Adds and prepares the Android platform (also applies any project fixes)"
+  lane :prepare do
+    configure
+    ionic_build
+  end
+
+  desc "Builds the Android binary"
+  lane :build do
+    gradle(
+      project_dir: 'android',
+      task: 'assemble',
+      build_type: 'Release',
+      properties: {
+        "android.injected.signing.store.file" => File.absolute_path(File.join("..", "./.android_signing/#{ENV['ANDROID_KEYSTORE_KEYSTORE_NAME']}")),
+        "android.injected.signing.store.password" => ENV['ANDROID_KEYSTORE_PASSWORD'],
+        "android.injected.signing.key.alias" => ENV['ANDROID_KEYSTORE_ALIAS_NAME'],
+        "android.injected.signing.key.password" => ENV['ANDROID_KEYSTORE_KEY_PASSWORD']
+      }
+    )
+
+    apk_path = Actions.lane_context[SharedValues::GRADLE_APK_OUTPUT_PATH] 
+    puts "apk_path: #{apk_path}"
+  end
+    
+  desc "Builds and distributes the Android staging binary from a clean state"
+  lane :staging do
+    prepare
+    build
+
+    path = [ENV['S3_BUCKET_APP_DIRECTORY'], 'android']
+    path += ['pr', ci_pr_number] if ci_pr_number
+   
+    aws_s3(
+      app_directory: File.join(path)
+    ) unless ENV['SKIP_DISTRIBUTION']
+
+    url = Actions.lane_context[SharedValues::S3_HTML_OUTPUT_PATH]
+    comment_on_pr(
+      body: "Download Android app at #{url}" 
+    )
+  end
+
+  desc "Builds and distributes the Android release binary from a clean state"
+  lane :release do
+    
+  end
+
+end
