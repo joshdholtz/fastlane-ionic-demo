@@ -4,7 +4,7 @@ module Fastlane
         def self.run(params)
           pr_url = ENV["CIRCLE_PULL_REQUEST"]
 
-          if pr_url.to_s.length > 0 && body.to_s.length > 0
+          if pr_url.to_s.length > 0
             require 'uri'
             return URI(pr_url).path.split('/').last
           end
