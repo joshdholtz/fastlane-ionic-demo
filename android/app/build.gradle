@@ -6,7 +6,7 @@ android {
         applicationId "io.ionic.starter"
         minSdkVersion 21
         targetSdkVersion 28
-        versionCode 1
+        versionCode 1574743023
         versionName "1.0"
         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
     }
